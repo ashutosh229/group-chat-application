@@ -1,0 +1,13 @@
+{
+  "name": "group-chat-websocket",
+  "version": "2.0.0",
+  "description": "Real-time multi-room group chat with private messaging, moderation, presence, persistence, and rate limiting, built on WebSockets.",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node tests/simulate.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
