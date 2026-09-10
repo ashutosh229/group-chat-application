@@ -1,0 +1,48 @@
+{
+  "sweep": [
+    {
+      "clients": 5,
+      "throughput": 18.26,
+      "post_avg_ms": 137.67,
+      "post_p50_ms": 86.14,
+      "post_p95_ms": 304.22,
+      "post_p99_ms": 510.5,
+      "feed_avg_ms": 347.7,
+      "feed_p95_ms": 522.25,
+      "errors": 0
+    },
+    {
+      "clients": 15,
+      "throughput": 23.0,
+      "post_avg_ms": 462.85,
+      "post_p50_ms": 417.47,
+      "post_p95_ms": 1111.92,
+      "post_p99_ms": 1210.17,
+      "feed_avg_ms": 603.9,
+      "feed_p95_ms": 1389.48,
+      "errors": 0
+    },
+    {
+      "clients": 30,
+      "throughput": 23.13,
+      "post_avg_ms": 976.23,
+      "post_p50_ms": 802.09,
+      "post_p95_ms": 2189.97,
+      "post_p99_ms": 2654.01,
+      "feed_avg_ms": 1076.43,
+      "feed_p95_ms": 2318.58,
+      "errors": 0
+    },
+    {
+      "clients": 50,
+      "throughput": 20.98,
+      "post_avg_ms": 1872.91,
+      "post_p50_ms": 1652.53,
+      "post_p95_ms": 4054.79,
+      "post_p99_ms": 4818.38,
+      "feed_avg_ms": 2146.76,
+      "feed_p95_ms": 4483.89,
+      "errors": 0
+    }
+  ]
+}

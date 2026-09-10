@@ -1,0 +1,40 @@
+{
+  "config": {
+    "mode": "http",
+    "url": "http://127.0.0.1:4000",
+    "num_clients": 20,
+    "num_messages_per_client": 8,
+    "min_length": 10,
+    "max_length": 120,
+    "interval_s": 0.05,
+    "jitter": 0.5
+  },
+  "summary": {
+    "duration_s": 59.64,
+    "total_messages_sent": 132,
+    "total_feeds_fetched": 27,
+    "total_requests": 159,
+    "throughput_rps": 2.67,
+    "total_errors": 41
+  },
+  "post_message_latency_ms": {
+    "count": 132,
+    "avg": 3005.4,
+    "min": 56.63,
+    "max": 10885.69,
+    "p50": 730.42,
+    "p90": 8213.62,
+    "p95": 9675.78,
+    "p99": 10308.97
+  },
+  "get_feed_latency_ms": {
+    "count": 27,
+    "avg": 5810.96,
+    "min": 2269.26,
+    "max": 10394.33,
+    "p50": 4975.75,
+    "p90": 9650.09,
+    "p95": 9997.44,
+    "p99": 10394.33
+  }
+}

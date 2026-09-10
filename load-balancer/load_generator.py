@@ -1,54 +1,208 @@
-#!/usr/bin/env python3
 """
-Load Generator for WebSocket Chat App
-=======================================
-Spawns many concurrent WebSocket clients, connects them through the
-load balancer, joins rooms, sends messages, and measures end-to-end
-latency + throughput.
+Performance Load Generator & Experimentation Tool
+for Secure Group-Chat Application & Dynamic Load Balancer.
 
-Usage:
-    python load_generator.py --url ws://localhost:8080/ws --clients 50 --messages 20
-    python load_generator.py --url ws://localhost:8080/ws --clients 100 --messages 50 --ramp-delay 0.05
-
-Output:
-    - Real-time progress in terminal
-    - Final summary table with latency percentiles
-    - Saves detailed results to results_<timestamp>.json
+Supports:
+- Target API Routes: POST /message and GET /feed (as specified by instructor)
+- WebSocket Chat stress testing (/ws)
+- Variable number of concurrent users / clients (--clients)
+- Random / variable message lengths (--min-len, --max-len)
+- Random / variable time intervals between messages (--interval, --jitter, or Poisson distribution)
+- Automatic latency percentile calculations (Avg, Min, Max, P50, P90, P95, P99)
+- JSON export for reporting and benchmarking plots
 """
 
 import argparse
 import asyncio
 import json
+import math
+import os
 import random
 import statistics
 import string
-import time
 import sys
-import os
-
+import time
+from typing import Dict, List, Any, Optional
+import urllib.request
+import urllib.parse
+import aiohttp
 import websockets
 
+# Ensure clean UTF-8 stdout across Windows/Linux
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
-# ---------------------------------------------------------------------------
-# Simulated client
-# ---------------------------------------------------------------------------
-class SimulatedClient:
-    """One simulated WebSocket chat user."""
 
-    def __init__(self, client_id: int, url: str, num_messages: int, message_delay: float):
+
+def random_message(min_len: int = 10, max_len: int = 150) -> str:
+    """Generate a random sentence or string between min_len and max_len."""
+    length = random.randint(min_len, max_len)
+    words = [
+        "quantum", "distributed", "consensus", "cluster", "loadbalancer", "latency",
+        "throughput", "resilience", "failover", "algorithm", "threshold", "performance",
+        "crypto", "signature", "encryption", "payload", "pipeline", "database", "stream",
+        "websocket", "goroutine", "dynamic", "network", "benchmark", "analysis"
+    ]
+    cur = []
+    cur_len = 0
+    while cur_len < length:
+        w = random.choice(words)
+        cur.append(w)
+        cur_len += len(w) + 1
+    text = " ".join(cur)
+    return text[:length]
+
+
+def random_delay(base_interval: float, jitter: float = 0.5, dist: str = "uniform") -> float:
+    """Generate a random interval between requests."""
+    if base_interval <= 0:
+        return 0.0
+    if dist == "exponential":
+        # Poisson process arrival times (exponential inter-arrival)
+        return random.expovariate(1.0 / base_interval)
+    else:
+        # Uniform jitter: base * (1 +/- jitter)
+        low = max(0.0, base_interval * (1.0 - jitter))
+        high = base_interval * (1.0 + jitter)
+        return random.uniform(low, high)
+
+
+# ===========================================================================
+# HTTP Simulated Client (Testing POST /message and GET /feed)
+# ===========================================================================
+
+class HTTPSimulatedClient:
+    def __init__(
+        self,
+        client_id: int,
+        base_url: str,
+        num_messages: int,
+        feed_freq: int,
+        min_len: int,
+        max_len: int,
+        interval: float,
+        jitter: float,
+    ):
         self.client_id = client_id
-        self.url = url
+        self.base_url = base_url.rstrip("/")
         self.num_messages = num_messages
-        self.message_delay = message_delay
-        self.username = f"loadbot_{client_id}_{_rand_suffix()}"
+        self.feed_freq = feed_freq  # fetch feed every N messages
+        self.min_len = min_len
+        self.max_len = max_len
+        self.interval = interval
+        self.jitter = jitter
 
-        # Results
+        self.username = f"user_{client_id}_{''.join(random.choices(string.ascii_lowercase, k=4))}"
+        self.post_latencies: List[float] = []
+        self.feed_latencies: List[float] = []
+        self.messages_sent = 0
+        self.feeds_fetched = 0
+        self.errors: List[str] = []
+        self.start_time: float = 0
+        self.end_time: float = 0
+
+    async def run(self, session: aiohttp.ClientSession) -> None:
+        self.start_time = time.time()
+        msg_url = f"{self.base_url}/message"
+        feed_url = f"{self.base_url}/feed"
+
+        try:
+            for i in range(self.num_messages):
+                # 1. Random message content & variable length
+                text = random_message(self.min_len, self.max_len)
+                msg_id = f"msg_{self.username}_{i}_{int(time.time()*1000)}"
+
+                payload = {
+                    "client-name": self.username,
+                    "msg": text,
+                    "id": msg_id,
+                    "timestamp": int(time.time() * 1000),
+                }
+
+                # Send POST /message and record latency
+                t0 = time.time()
+                try:
+                    async with session.post(msg_url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        lat = (time.time() - t0) * 1000.0
+                        if resp.status < 400:
+                            self.post_latencies.append(lat)
+                            self.messages_sent += 1
+                        else:
+                            self.errors.append(f"POST HTTP {resp.status}")
+                except Exception as exc:
+                    self.errors.append(f"POST err: {exc}")
+
+                # 2. Optionally fetch GET /feed
+                if self.feed_freq > 0 and (i + 1) % self.feed_freq == 0:
+                    t_feed = time.time()
+                    try:
+                        async with session.get(feed_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            f_lat = (time.time() - t_feed) * 1000.0
+                            if resp.status < 400:
+                                self.feed_latencies.append(f_lat)
+                                self.feeds_fetched += 1
+                            else:
+                                self.errors.append(f"FEED HTTP {resp.status}")
+                    except Exception as exc:
+                        self.errors.append(f"FEED err: {exc}")
+
+                # 3. Variable random inter-arrival time
+                sleep_sec = random_delay(self.interval, self.jitter)
+                if sleep_sec > 0:
+                    await asyncio.sleep(sleep_sec)
+
+        except Exception as exc:
+            self.errors.append(f"Client exception: {exc}")
+        finally:
+            self.end_time = time.time()
+
+    def summary(self) -> Dict[str, Any]:
+        duration = self.end_time - self.start_time if self.end_time else 0
+        return {
+            "client_id": self.client_id,
+            "username": self.username,
+            "messages_sent": self.messages_sent,
+            "feeds_fetched": self.feeds_fetched,
+            "avg_post_latency_ms": round(statistics.mean(self.post_latencies), 2) if self.post_latencies else None,
+            "avg_feed_latency_ms": round(statistics.mean(self.feed_latencies), 2) if self.feed_latencies else None,
+            "duration_s": round(duration, 2),
+            "errors": self.errors,
+        }
+
+
+# ===========================================================================
+# WebSocket Simulated Client (/ws)
+# ===========================================================================
+
+class WSSimulatedClient:
+    def __init__(
+        self,
+        client_id: int,
+        ws_url: str,
+        num_messages: int,
+        min_len: int,
+        max_len: int,
+        interval: float,
+        jitter: float,
+    ):
+        self.client_id = client_id
+        self.ws_url = ws_url
+        self.num_messages = num_messages
+        self.min_len = min_len
+        self.max_len = max_len
+        self.interval = interval
+        self.jitter = jitter
+
+        self.username = f"ws_bot_{client_id}_{''.join(random.choices(string.ascii_lowercase, k=4))}"
         self.connected = False
-        self.join_latency_ms: float | None = None
-        self.message_latencies: list[float] = []  # per-message round-trip
+        self.join_latency_ms: Optional[float] = None
+        self.msg_latencies: List[float] = []
         self.messages_sent = 0
         self.messages_received = 0
-        self.errors: list[str] = []
+        self.errors: List[str] = []
         self.start_time: float = 0
         self.end_time: float = 0
 
@@ -56,14 +210,12 @@ class SimulatedClient:
         self.start_time = time.time()
         try:
             async with websockets.connect(
-                self.url,
+                self.ws_url,
                 open_timeout=15,
                 close_timeout=5,
                 max_size=4 * 1024 * 1024,
             ) as ws:
                 self.connected = True
-
-                # --- Join ---
                 t0 = time.time()
                 await ws.send(json.dumps({
                     "type": "join",
@@ -71,52 +223,45 @@ class SimulatedClient:
                     "room": "general",
                 }))
 
-                # Wait for welcome message
-                welcome = await asyncio.wait_for(self._wait_for_type(ws, "welcome"), timeout=10)
-                self.join_latency_ms = (time.time() - t0) * 1000
+                # Wait for welcome
+                while True:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                    data = json.loads(raw)
+                    if data.get("type") == "welcome":
+                        self.join_latency_ms = (time.time() - t0) * 1000.0
+                        break
 
-                # --- Send messages and measure round-trip ---
-                pending_acks: dict[str, float] = {}  # msg_id -> send_time
+                pending_sends: Dict[str, float] = {}
 
                 async def sender():
                     for i in range(self.num_messages):
-                        text = f"[load-test] msg {i+1}/{self.num_messages} from {self.username}"
+                        text = random_message(self.min_len, self.max_len)
                         msg_id = f"{self.username}_{i}"
-                        pending_acks[msg_id] = time.time()
-                        await ws.send(json.dumps({
-                            "type": "message",
-                            "text": text,
-                        }))
+                        pending_sends[msg_id] = time.time()
+                        await ws.send(json.dumps({"type": "message", "text": text}))
                         self.messages_sent += 1
-                        if self.message_delay > 0:
-                            await asyncio.sleep(self.message_delay)
+                        delay = random_delay(self.interval, self.jitter)
+                        if delay > 0:
+                            await asyncio.sleep(delay)
 
                 async def receiver():
-                    deadline = time.time() + (self.num_messages * (self.message_delay + 1)) + 15
+                    deadline = time.time() + (self.num_messages * (self.interval + 1.0)) + 15
                     delivered_count = 0
                     try:
                         while delivered_count < self.num_messages and time.time() < deadline:
                             raw = await asyncio.wait_for(ws.recv(), timeout=10)
                             data = json.loads(raw)
                             self.messages_received += 1
-
                             if data.get("type") == "delivered":
                                 delivered_count += 1
-                                # Match to earliest pending send
-                                if pending_acks:
-                                    oldest_key = min(pending_acks, key=pending_acks.get)
-                                    send_time = pending_acks.pop(oldest_key)
-                                    rtt = (time.time() - send_time) * 1000
-                                    self.message_latencies.append(rtt)
-                    except asyncio.TimeoutError:
-                        pass
-                    except websockets.exceptions.ConnectionClosed:
+                                if pending_sends:
+                                    k = min(pending_sends, key=pending_sends.get)
+                                    send_t = pending_sends.pop(k)
+                                    self.msg_latencies.append((time.time() - send_t) * 1000.0)
+                    except Exception:
                         pass
 
-                # Run sender and receiver concurrently
                 await asyncio.gather(sender(), receiver())
-
-                # Graceful close
                 await ws.close()
 
         except Exception as exc:
@@ -124,16 +269,7 @@ class SimulatedClient:
         finally:
             self.end_time = time.time()
 
-    async def _wait_for_type(self, ws, msg_type: str) -> dict:
-        """Read messages until we get one of the desired type."""
-        while True:
-            raw = await ws.recv()
-            data = json.loads(raw)
-            self.messages_received += 1
-            if data.get("type") == msg_type:
-                return data
-
-    def summary(self) -> dict:
+    def summary(self) -> Dict[str, Any]:
         duration = self.end_time - self.start_time if self.end_time else 0
         return {
             "client_id": self.client_id,
@@ -142,212 +278,296 @@ class SimulatedClient:
             "join_latency_ms": round(self.join_latency_ms, 2) if self.join_latency_ms else None,
             "messages_sent": self.messages_sent,
             "messages_received": self.messages_received,
-            "message_latencies_ms": [round(l, 2) for l in self.message_latencies],
-            "avg_latency_ms": round(statistics.mean(self.message_latencies), 2) if self.message_latencies else None,
+            "avg_latency_ms": round(statistics.mean(self.msg_latencies), 2) if self.msg_latencies else None,
             "duration_s": round(duration, 2),
             "errors": self.errors,
         }
 
 
-def _rand_suffix(n=4) -> str:
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+# ===========================================================================
+# Metric Aggregation
+# ===========================================================================
+
+def calc_percentiles(vals: List[float]) -> Dict[str, Any]:
+    if not vals:
+        return {"count": 0, "avg": 0, "min": 0, "max": 0, "p50": 0, "p90": 0, "p95": 0, "p99": 0}
+    s = sorted(vals)
+    n = len(s)
+
+    def p(pct: float) -> float:
+        idx = max(0, min(n - 1, int(math.ceil(pct * n)) - 1))
+        return round(s[idx], 2)
+
+    return {
+        "count": n,
+        "avg": round(statistics.mean(s), 2),
+        "min": round(s[0], 2),
+        "max": round(s[-1], 2),
+        "p50": p(0.50),
+        "p90": p(0.90),
+        "p95": p(0.95),
+        "p99": p(0.99),
+    }
 
 
-# ---------------------------------------------------------------------------
-# Load generator orchestrator
-# ---------------------------------------------------------------------------
-async def run_load_test(
+# ===========================================================================
+# Main Load Test Orchestrator
+# ===========================================================================
+
+async def run_http_load_test(
     url: str,
     num_clients: int,
     num_messages: int,
-    message_delay: float,
+    feed_freq: int,
+    min_len: int,
+    max_len: int,
+    interval: float,
+    jitter: float,
     ramp_delay: float,
-) -> dict:
-    """Spawn clients, run load test, return aggregated results."""
-
-    print(f"\n{'='*60}")
-    print(f"  LOAD GENERATOR — WebSocket Chat Stress Test")
-    print(f"{'='*60}")
-    print(f"  Target URL      : {url}")
-    print(f"  Clients          : {num_clients}")
-    print(f"  Messages/client  : {num_messages}")
-    print(f"  Message delay    : {message_delay}s")
-    print(f"  Ramp-up delay    : {ramp_delay}s")
-    print(f"  Total messages   : {num_clients * num_messages}")
-    print(f"{'='*60}\n")
+) -> Dict[str, Any]:
+    print(f"\n{'='*70}")
+    print("  🚀 HTTP API LOAD GENERATOR (/message & /feed)")
+    print(f"{'='*70}")
+    print(f"  Target URL           : {url}")
+    print(f"  Concurrent Clients   : {num_clients}")
+    print(f"  Messages / Client    : {num_messages}")
+    print(f"  Total Requests       : ~{num_clients * num_messages}")
+    print(f"  Message Length       : {min_len} to {max_len} chars (randomized)")
+    print(f"  Time Interval        : {interval}s ± {int(jitter*100)}% jitter")
+    print(f"  Feed Polling Freq    : every {feed_freq} msgs" if feed_freq > 0 else "  Feed Polling Freq    : disabled")
+    print(f"{'='*70}\n")
 
     clients = [
-        SimulatedClient(i, url, num_messages, message_delay)
+        HTTPSimulatedClient(i, url, num_messages, feed_freq, min_len, max_len, interval, jitter)
         for i in range(num_clients)
     ]
 
-    # Staggered start
-    tasks = []
-    overall_start = time.time()
+    t0 = time.time()
+    connector = aiohttp.TCPConnector(limit=num_clients * 2, keepalive_timeout=60)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = []
+        for i, client in enumerate(clients):
+            async def launch(c: HTTPSimulatedClient, delay: float):
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                await c.run(session)
 
-    async def launch(client: SimulatedClient, delay: float):
-        if delay > 0:
-            await asyncio.sleep(delay)
-        await client.run()
+            tasks.append(asyncio.create_task(launch(client, i * ramp_delay)))
 
-    for i, client in enumerate(clients):
-        tasks.append(asyncio.create_task(launch(client, i * ramp_delay)))
+        # Progress monitor
+        async def monitor():
+            while not all(t.done() for t in tasks):
+                done = sum(1 for c in clients if c.end_time > 0)
+                sent = sum(c.messages_sent for c in clients)
+                errs = sum(len(c.errors) for c in clients)
+                print(f"\r  [Running] Clients done: {done}/{num_clients} | Messages sent: {sent} | Errors: {errs}", end="", flush=True)
+                await asyncio.sleep(0.4)
+            print()
 
-    # Progress reporting
-    async def progress_reporter():
-        while not all(t.done() for t in tasks):
-            done_count = sum(1 for c in clients if c.end_time > 0)
-            active = sum(1 for c in clients if c.connected and c.end_time == 0)
-            sent = sum(c.messages_sent for c in clients)
-            print(
-                f"\r  Progress: {done_count}/{num_clients} done | "
-                f"{active} active | {sent} msgs sent",
-                end="", flush=True,
-            )
-            await asyncio.sleep(0.5)
-        print()
+        mon = asyncio.create_task(monitor())
+        await asyncio.gather(*tasks)
+        mon.cancel()
 
-    reporter = asyncio.create_task(progress_reporter())
-    await asyncio.gather(*tasks)
-    reporter.cancel()
-    try:
-        await reporter
-    except asyncio.CancelledError:
-        pass
+    duration = time.time() - t0
 
-    overall_duration = time.time() - overall_start
-
-    # --- Aggregate results ---
-    all_latencies = []
-    all_join_latencies = []
+    all_posts = []
+    all_feeds = []
     total_sent = 0
-    total_received = 0
-    total_errors = 0
-    successful_clients = 0
+    total_feeds = 0
+    total_errs = 0
 
     for c in clients:
-        s = c.summary()
-        if c.connected and not c.errors:
-            successful_clients += 1
+        all_posts.extend(c.post_latencies)
+        all_feeds.extend(c.feed_latencies)
         total_sent += c.messages_sent
-        total_received += c.messages_received
-        total_errors += len(c.errors)
-        all_latencies.extend(c.message_latencies)
-        if c.join_latency_ms is not None:
-            all_join_latencies.append(c.join_latency_ms)
+        total_feeds += c.feeds_fetched
+        total_errs += len(c.errors)
 
-    def pstats(vals):
-        if not vals:
-            return {"count": 0, "avg": 0, "min": 0, "max": 0, "p50": 0, "p95": 0, "p99": 0}
-        s = sorted(vals)
-        n = len(s)
-        return {
-            "count": n,
-            "avg": round(statistics.mean(s), 2),
-            "min": round(s[0], 2),
-            "max": round(s[-1], 2),
-            "p50": round(s[n // 2], 2),
-            "p95": round(s[int(n * 0.95)] if n >= 20 else s[-1], 2),
-            "p99": round(s[int(n * 0.99)] if n >= 100 else s[-1], 2),
-        }
+    post_stats = calc_percentiles(all_posts)
+    feed_stats = calc_percentiles(all_feeds)
+    rps = round((total_sent + total_feeds) / duration, 2) if duration > 0 else 0
 
     results = {
-        "test_config": {
+        "config": {
+            "mode": "http",
             "url": url,
             "num_clients": num_clients,
             "num_messages_per_client": num_messages,
-            "message_delay_s": message_delay,
-            "ramp_delay_s": ramp_delay,
+            "min_length": min_len,
+            "max_length": max_len,
+            "interval_s": interval,
+            "jitter": jitter,
         },
         "summary": {
-            "duration_s": round(overall_duration, 2),
-            "successful_clients": successful_clients,
-            "failed_clients": num_clients - successful_clients,
+            "duration_s": round(duration, 2),
             "total_messages_sent": total_sent,
-            "total_messages_received": total_received,
-            "throughput_msgs_per_sec": round(total_sent / overall_duration, 2) if overall_duration > 0 else 0,
-            "total_errors": total_errors,
+            "total_feeds_fetched": total_feeds,
+            "total_requests": total_sent + total_feeds,
+            "throughput_rps": rps,
+            "total_errors": total_errs,
         },
-        "join_latency_ms": pstats(all_join_latencies),
-        "message_round_trip_ms": pstats(all_latencies),
-        "per_client": [c.summary() for c in clients],
+        "post_message_latency_ms": post_stats,
+        "get_feed_latency_ms": feed_stats,
     }
 
-    # --- Print summary ---
-    print(f"\n{'='*60}")
-    print(f"  RESULTS")
-    print(f"{'='*60}")
-    print(f"  Duration        : {results['summary']['duration_s']}s")
-    print(f"  Clients OK/Fail : {successful_clients}/{num_clients - successful_clients}")
-    print(f"  Messages Sent   : {total_sent}")
-    print(f"  Throughput      : {results['summary']['throughput_msgs_per_sec']} msg/s")
-    print()
+    print(f"\n{'='*70}")
+    print("  📊 EVALUATION RESULTS SUMMARY")
+    print(f"{'='*70}")
+    print(f"  Duration           : {results['summary']['duration_s']} s")
+    print(f"  Total Requests     : {results['summary']['total_requests']} (Sent: {total_sent}, Feeds: {total_feeds})")
+    print(f"  Throughput         : {rps} req/sec")
+    print(f"  Total Errors       : {total_errs}")
+    print(f"{'─'*70}")
+    print(f"  {'Metric':<18} {'POST /message':>20} {'GET /feed':>20}")
+    print(f"  {'─'*18} {'─'*20} {'─'*20}")
+    for k in ["avg", "p50", "p90", "p95", "p99", "min", "max"]:
+        print(f"  {k.upper():<18} {post_stats[k]:>17.2f} ms {feed_stats[k]:>17.2f} ms")
+    print(f"  {'Samples':<18} {post_stats['count']:>20} {feed_stats['count']:>20}")
+    print(f"{'='*70}\n")
 
-    jl = results["join_latency_ms"]
-    ml = results["message_round_trip_ms"]
-
-    print(f"  {'Metric':<20} {'Join Latency':>14} {'Msg Round-Trip':>14}")
-    print(f"  {'─'*20} {'─'*14} {'─'*14}")
-    for key in ["avg", "p50", "p95", "p99", "min", "max"]:
-        print(f"  {key.upper():<20} {jl[key]:>11.2f} ms {ml[key]:>11.2f} ms")
-    print(f"  {'Count':<20} {jl['count']:>14} {ml['count']:>14}")
-    print(f"{'='*60}\n")
-
-    # --- Save to file ---
+    # Save results
     ts = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"results_{ts}.json"
-    with open(filename, "w") as f:
+    out_file = f"results_http_{ts}.json"
+    with open(out_file, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"  Detailed results saved to: {filename}\n")
-
+    print(f"  📁 Output saved to: {out_file}\n")
     return results
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+async def run_ws_load_test(
+    url: str,
+    num_clients: int,
+    num_messages: int,
+    min_len: int,
+    max_len: int,
+    interval: float,
+    jitter: float,
+    ramp_delay: float,
+) -> Dict[str, Any]:
+    print(f"\n{'='*70}")
+    print("  🚀 WEBSOCKET LOAD GENERATOR (/ws)")
+    print(f"{'='*70}")
+    print(f"  Target URL           : {url}")
+    print(f"  Concurrent Clients   : {num_clients}")
+    print(f"  Messages / Client    : {num_messages}")
+    print(f"  Message Length       : {min_len} to {max_len} chars")
+    print(f"  Interval             : {interval}s ± {int(jitter*100)}% jitter")
+    print(f"{'='*70}\n")
+
+    clients = [
+        WSSimulatedClient(i, url, num_messages, min_len, max_len, interval, jitter)
+        for i in range(num_clients)
+    ]
+
+    t0 = time.time()
+    tasks = []
+    for i, c in enumerate(clients):
+        async def launch(client: WSSimulatedClient, delay: float):
+            if delay > 0:
+                await asyncio.sleep(delay)
+            await client.run()
+
+        tasks.append(asyncio.create_task(launch(c, i * ramp_delay)))
+
+    await asyncio.gather(*tasks)
+    duration = time.time() - t0
+
+    all_lat = []
+    all_joins = []
+    total_sent = 0
+    total_errs = 0
+
+    for c in clients:
+        all_lat.extend(c.msg_latencies)
+        if c.join_latency_ms is not None:
+            all_joins.append(c.join_latency_ms)
+        total_sent += c.messages_sent
+        total_errs += len(c.errors)
+
+    join_stats = calc_percentiles(all_joins)
+    msg_stats = calc_percentiles(all_lat)
+    rps = round(total_sent / duration, 2) if duration > 0 else 0
+
+    results = {
+        "config": {
+            "mode": "ws",
+            "url": url,
+            "num_clients": num_clients,
+            "num_messages_per_client": num_messages,
+        },
+        "summary": {
+            "duration_s": round(duration, 2),
+            "total_messages_sent": total_sent,
+            "throughput_msgs_per_sec": rps,
+            "total_errors": total_errs,
+        },
+        "join_latency_ms": join_stats,
+        "message_relay_latency_ms": msg_stats,
+    }
+
+    print(f"\n{'='*70}")
+    print("  📊 WEBSOCKET EVALUATION SUMMARY")
+    print(f"{'='*70}")
+    print(f"  Duration           : {results['summary']['duration_s']} s")
+    print(f"  Throughput         : {rps} msg/sec")
+    print(f"  Total Errors       : {total_errs}")
+    print(f"{'─'*70}")
+    print(f"  {'Metric':<18} {'WS Handshake':>20} {'Message Relay':>20}")
+    print(f"  {'─'*18} {'─'*20} {'─'*20}")
+    for k in ["avg", "p50", "p90", "p95", "p99", "min", "max"]:
+        print(f"  {k.upper():<18} {join_stats[k]:>17.2f} ms {msg_stats[k]:>17.2f} ms")
+    print(f"{'='*70}\n")
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_file = f"results_ws_{ts}.json"
+    with open(out_file, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"  📁 Output saved to: {out_file}\n")
+    return results
+
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Load Generator for WebSocket Chat App"
-    )
-    parser.add_argument(
-        "--url",
-        default="ws://localhost:8080/ws",
-        help="WebSocket URL of the load balancer (default: ws://localhost:8080/ws)",
-    )
-    parser.add_argument(
-        "--clients",
-        type=int,
-        default=50,
-        help="Number of concurrent simulated clients (default: 50)",
-    )
-    parser.add_argument(
-        "--messages",
-        type=int,
-        default=20,
-        help="Messages each client sends (default: 20)",
-    )
-    parser.add_argument(
-        "--message-delay",
-        type=float,
-        default=0.1,
-        help="Delay between messages in seconds (default: 0.1)",
-    )
-    parser.add_argument(
-        "--ramp-delay",
-        type=float,
-        default=0.05,
-        help="Delay between client spawns in seconds (default: 0.05)",
-    )
+    parser = argparse.ArgumentParser(description="Performance Load Generator for Group Chat")
+    parser.add_argument("--mode", choices=["http", "ws"], default="http", help="Protocol mode (default: http)")
+    parser.add_argument("--url", default="http://localhost:4000", help="Load Balancer URL (default: http://localhost:4000)")
+    parser.add_argument("--clients", type=int, default=30, help="Number of concurrent clients (default: 30)")
+    parser.add_argument("--messages", type=int, default=15, help="Number of messages per client (default: 15)")
+    parser.add_argument("--feed-freq", type=int, default=3, help="Fetch GET /feed every N messages (default: 3)")
+    parser.add_argument("--min-len", type=int, default=10, help="Min message length (default: 10)")
+    parser.add_argument("--max-len", type=int, default=120, help="Max message length (default: 120)")
+    parser.add_argument("--interval", type=float, default=0.1, help="Base time interval between messages in seconds (default: 0.1)")
+    parser.add_argument("--jitter", type=float, default=0.5, help="Random interval jitter fraction 0..1 (default: 0.5)")
+    parser.add_argument("--ramp-delay", type=float, default=0.02, help="Ramp up stagger delay between clients (default: 0.02)")
     args = parser.parse_args()
 
-    asyncio.run(run_load_test(
-        url=args.url,
-        num_clients=args.clients,
-        num_messages=args.messages,
-        message_delay=args.message_delay,
-        ramp_delay=args.ramp_delay,
-    ))
+    if args.mode == "http":
+        asyncio.run(run_http_load_test(
+            url=args.url,
+            num_clients=args.clients,
+            num_messages=args.messages,
+            feed_freq=args.feed_freq,
+            min_len=args.min_len,
+            max_len=args.max_len,
+            interval=args.interval,
+            jitter=args.jitter,
+            ramp_delay=args.ramp_delay,
+        ))
+    else:
+        ws_url = args.url
+        if ws_url.startswith("http://"):
+            ws_url = ws_url.replace("http://", "ws://") + "/ws"
+        elif ws_url.startswith("https://"):
+            ws_url = ws_url.replace("https://", "wss://") + "/ws"
+        asyncio.run(run_ws_load_test(
+            url=ws_url,
+            num_clients=args.clients,
+            num_messages=args.messages,
+            min_len=args.min_len,
+            max_len=args.max_len,
+            interval=args.interval,
+            jitter=args.jitter,
+            ramp_delay=args.ramp_delay,
+        ))
 
 
 if __name__ == "__main__":
