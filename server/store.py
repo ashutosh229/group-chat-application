@@ -24,7 +24,11 @@ SECURITY_ENABLED = os.environ.get(
 
 
 # Single MongoClient is thread-safe and connection-pooled
-_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+_client = MongoClient(
+    MONGODB_URI,
+    maxPoolSize=200,
+    serverSelectionTimeoutMS=5000,
+)
 _db = _client[MONGODB_DB]
 
 # Collections
