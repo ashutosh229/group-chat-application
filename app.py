@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, Response
 from server import config, logger, store
 from server.rooms import RoomManager
 from server.ws_server import WSServer
+from starlette.concurrency import run_in_threadpool
 
 room_manager = RoomManager(logger)
 ws_server = WSServer(room_manager, logger)
@@ -146,7 +147,11 @@ async def post_message(request: Request):
     }
 
     # Encrypt (AES-GCM), Sign (Ed25519), and Store in MongoDB (dedup on _id)
-    saved = store.append_message(room, msg_obj)
+    saved = await run_in_threadpool(
+        store.append_message,
+        room,
+        msg_obj,
+    )
 
     # Real-time WebSocket broadcast to room
     room_manager.broadcast(room, {"type": "message", **msg_obj})
@@ -169,7 +174,11 @@ async def get_feed_route(room: str = None, limit: int = 100000):
     """
     Retrieves all messages stored across backend, decrypted and verified.
     """
-    return store.get_feed(room_id=room, limit=limit)
+    return await run_in_threadpool(
+        store.get_feed,
+        room_id=room,
+        limit=limit,
+    )
 
 
 # ---------------------------------------------------------------------------
