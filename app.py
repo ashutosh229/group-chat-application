@@ -220,10 +220,8 @@ if __name__ == "__main__":
         "app:app",
         host="0.0.0.0",
         port=config.PORT,
-        # ws_ping_interval / ws_ping_timeout: uvicorn sends WebSocket
-        # ping frames automatically — replaces flask-sock's
-        # SOCK_SERVER_OPTIONS ping_interval.
+        workers=4,
         ws_ping_interval=config.HEARTBEAT_INTERVAL_MS / 1000,
         ws_ping_timeout=config.HEARTBEAT_INTERVAL_MS / 1000,
-        log_level="warning",  # suppress uvicorn access logs; we have our own
+        log_level="warning",
     )
