@@ -1,5 +1,6 @@
 import os
 import threading
+
 from typing import List, Dict, Any, Optional
 
 from cryptography.exceptions import InvalidTag
@@ -13,7 +14,14 @@ MONGODB_URI = os.environ.get(
     "MONGODB_URI",
     "mongodb+srv://shashankyadavriiii_db_user:9Y2RNLoRD6OWSC4h@cluster0.7azo9pt.mongodb.net",
 )
+
 MONGODB_DB = os.environ.get("MONGODB_DB", "group_chat")
+
+SECURITY_ENABLED = os.environ.get(
+    "SECURITY_ENABLED",
+    "true",
+).lower() in ("1", "true", "yes", "on")
+
 
 # Single MongoClient is thread-safe and connection-pooled
 _client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
@@ -31,17 +39,20 @@ _user_keys.create_index("username", unique=True)
 def _to_bytes(val) -> bytes:
     if isinstance(val, bytes):
         return val
+
     if isinstance(val, str):
         try:
             return bytes.fromhex(val)
         except ValueError:
             return val.encode("utf-8")
+
     return bytes(val)
 
 
 def _to_hex(val) -> str:
     if isinstance(val, bytes):
         return val.hex()
+
     return str(val)
 
 
@@ -51,8 +62,14 @@ _user_keys_cache: Dict[str, ed25519.Ed25519PublicKey] = {}
 # ---------------------------------------------------------------------------
 # User public keys
 # ---------------------------------------------------------------------------
+
+
 def save_user_public_key(username: str, public_key_bytes: bytes) -> None:
+    if not SECURITY_ENABLED:
+        return
+
     uname = username.lower()
+
     try:
         pub = ed25519.Ed25519PublicKey.from_public_bytes(public_key_bytes)
         _user_keys_cache[uname] = pub
@@ -66,12 +83,19 @@ def save_user_public_key(username: str, public_key_bytes: bytes) -> None:
     )
 
 
-def get_user_public_key(username: str) -> Optional[ed25519.Ed25519PublicKey]:
+def get_user_public_key(
+    username: str,
+) -> Optional[ed25519.Ed25519PublicKey]:
+    if not SECURITY_ENABLED:
+        return None
+
     uname = username.lower()
+
     if uname in _user_keys_cache:
         return _user_keys_cache[uname]
 
     doc = _user_keys.find_one({"username": uname})
+
     if doc:
         raw_bytes = _to_bytes(doc["public_key"])
         pub = ed25519.Ed25519PublicKey.from_public_bytes(raw_bytes)
@@ -81,30 +105,44 @@ def get_user_public_key(username: str) -> Optional[ed25519.Ed25519PublicKey]:
     # Fallback: generate/load from local keystore on disk
     _, pub = crypto.get_or_create_sender_keys(username)
     _user_keys_cache[uname] = pub
+
     return pub
+
+
+# ---------------------------------------------------------------------------
+# Message storage
+# ---------------------------------------------------------------------------
 
 
 def save_message(
     msg_id: str,
     room_id: str,
     sender: str,
-    ciphertext: bytes,
-    nonce: bytes,
-    signature: bytes,
+    text: str,
     timestamp: int,
+    ciphertext: Optional[bytes] = None,
+    nonce: Optional[bytes] = None,
+    signature: Optional[bytes] = None,
 ) -> None:
-    _messages.update_one(
-        {"_id": msg_id},
-        {
-            "$set": {
-                "room_id": room_id,
-                "sender": sender,
+    message_doc = {
+        "room_id": room_id,
+        "sender": sender,
+        "text": text,
+        "timestamp": timestamp,
+    }
+
+    if SECURITY_ENABLED:
+        message_doc.update(
+            {
                 "ciphertext": _to_hex(ciphertext),
                 "nonce": _to_hex(nonce),
                 "signature": _to_hex(signature),
-                "timestamp": timestamp,
             }
-        },
+        )
+
+    _messages.update_one(
+        {"_id": msg_id},
+        {"$set": message_doc},
         upsert=True,
     )
 
@@ -119,25 +157,64 @@ def append_message(
     text = msg["text"]
     timestamp = msg["timestamp"]
 
+    if not SECURITY_ENABLED:
+        save_message(
+            msg_id=msg_id,
+            room_id=room_id,
+            sender=sender,
+            text=text,
+            timestamp=timestamp,
+        )
+
+        return {
+            "id": msg_id,
+            "room": room_id,
+            "username": sender,
+            "text": text,
+            "timestamp": timestamp,
+            "verified": True,
+        }
+
     # Ensure sender keys exist
     if sender_private_key is None:
         sender_private_key, sender_pub = crypto.get_or_create_sender_keys(sender)
     else:
         sender_pub = sender_private_key.public_key()
 
-    save_user_public_key(sender, sender_pub.public_bytes_raw())
+    save_user_public_key(
+        sender,
+        sender_pub.public_bytes_raw(),
+    )
 
-    # 1. Encrypt (AES-GCM 256)
+    # Encrypt message
     ciphertext, nonce = crypto.encrypt_message(text)
 
-    # 2. Sign (Ed25519)
+    # Sign message
     signable_payload = crypto.make_signable_payload(
-        msg_id, room_id, sender, timestamp, nonce, ciphertext
+        msg_id,
+        room_id,
+        sender,
+        timestamp,
+        nonce,
+        ciphertext,
     )
-    signature = crypto.sign_message(sender_private_key, signable_payload)
 
-    # 3. Store in MongoDB
-    save_message(msg_id, room_id, sender, ciphertext, nonce, signature, timestamp)
+    signature = crypto.sign_message(
+        sender_private_key,
+        signable_payload,
+    )
+
+    # Store encrypted message
+    save_message(
+        msg_id=msg_id,
+        room_id=room_id,
+        sender=sender,
+        text=text,
+        timestamp=timestamp,
+        ciphertext=ciphertext,
+        nonce=nonce,
+        signature=signature,
+    )
 
     return {
         "id": msg_id,
@@ -149,46 +226,91 @@ def append_message(
     }
 
 
-def get_history(room_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# Message retrieval
+# ---------------------------------------------------------------------------
+
+
+def get_history(
+    room_id: str,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
     # Fetch newest N messages, then reverse for oldest-first display
     cursor = _messages.find(
         {"room_id": room_id},
         sort=[("timestamp", DESCENDING)],
         limit=limit,
     )
-    rows = list(reversed(list(cursor)))
 
+    rows = list(reversed(list(cursor)))
     history = []
+
     for doc in rows:
         msg_id = doc["_id"]
         sender = doc["sender"]
         timestamp = doc["timestamp"]
+
+        # Fast plaintext path when security is disabled
+        if not SECURITY_ENABLED:
+            text = doc.get("text", "")
+
+            history.append(
+                {
+                    "id": msg_id,
+                    "username": sender,
+                    "client-name": sender,
+                    "text": text,
+                    "msg": text,
+                    "room": room_id,
+                    "timestamp": timestamp,
+                    "verified": True,
+                    "tampered": False,
+                }
+            )
+
+            continue
+
         ciphertext = _to_bytes(doc["ciphertext"])
         nonce = _to_bytes(doc["nonce"])
         signature = _to_bytes(doc["signature"])
 
-        # 1. Verify Digital Signature (Ed25519)
+        # Verify digital signature
         pub_key = get_user_public_key(sender)
+
         signable_payload = crypto.make_signable_payload(
-            msg_id, room_id, sender, timestamp, nonce, ciphertext
+            msg_id,
+            room_id,
+            sender,
+            timestamp,
+            nonce,
+            ciphertext,
         )
 
         signature_valid = False
+
         if pub_key:
             signature_valid = crypto.verify_signature(
-                pub_key, signature, signable_payload
+                pub_key,
+                signature,
+                signable_payload,
             )
 
-        # 2. Decrypt (AES-GCM)
+        # Decrypt message
         decrypted_text = None
         decryption_valid = False
+
         try:
-            decrypted_text = crypto.decrypt_message(ciphertext, nonce)
+            decrypted_text = crypto.decrypt_message(
+                ciphertext,
+                nonce,
+            )
             decryption_valid = True
+
         except InvalidTag:
             decrypted_text = (
-                "[TAMPERED: AES-GCM Integrity Check Failed - Ciphertext Modified]"
+                "[TAMPERED: AES-GCM Integrity Check Failed - " "Ciphertext Modified]"
             )
+
         except Exception as e:
             decrypted_text = f"[DECRYPTION ERROR: {e}]"
 
@@ -215,10 +337,15 @@ def get_history(room_id: str, limit: int = 50) -> List[Dict[str, Any]]:
 
 
 def get_feed(
-    room_id: Optional[str] = None, limit: int = 100000
+    room_id: Optional[str] = None,
+    limit: int = 100000,
 ) -> List[Dict[str, Any]]:
-    """Retrieve all messages (across all rooms or filtered) sorted chronologically."""
+    """
+    Retrieve all messages across all rooms or filtered by room,
+    sorted chronologically.
+    """
     query = {}
+
     if room_id:
         query["room_id"] = room_id
 
@@ -227,7 +354,37 @@ def get_feed(
         sort=[("timestamp", DESCENDING)],
         limit=limit,
     )
+
     rows = list(reversed(list(cursor)))
+
+    # Fast path: no encryption, signing, verification, or key lookup.
+    if not SECURITY_ENABLED:
+        return [
+            {
+                "id": doc["_id"],
+                "client-name": doc.get(
+                    "sender",
+                    "Anonymous",
+                ),
+                "username": doc.get(
+                    "sender",
+                    "Anonymous",
+                ),
+                "msg": doc.get("text", ""),
+                "text": doc.get("text", ""),
+                "room": doc.get(
+                    "room_id",
+                    "general",
+                ),
+                "timestamp": doc.get(
+                    "timestamp",
+                    0,
+                ),
+                "verified": True,
+                "tampered": False,
+            }
+            for doc in rows
+        ]
 
     # Prefetch missing public keys in a single bulk query
     missing_senders = [
@@ -236,22 +393,27 @@ def get_feed(
         if doc.get("sender", "").lower()
         and doc.get("sender", "").lower() not in _user_keys_cache
     ]
+
     if missing_senders:
         for u_doc in _user_keys.find({"username": {"$in": list(set(missing_senders))}}):
             try:
                 raw_bytes = _to_bytes(u_doc["public_key"])
+
                 _user_keys_cache[u_doc["username"]] = (
                     ed25519.Ed25519PublicKey.from_public_bytes(raw_bytes)
                 )
+
             except Exception:
                 pass
 
     feed = []
+
     for doc in rows:
         msg_id = doc["_id"]
         sender = doc.get("sender", "Anonymous")
         r_id = doc.get("room_id", "general")
         timestamp = doc.get("timestamp", 0)
+
         ciphertext = _to_bytes(doc.get("ciphertext", ""))
         nonce = _to_bytes(doc.get("nonce", ""))
         signature = _to_bytes(doc.get("signature", ""))
@@ -259,22 +421,36 @@ def get_feed(
         pub_key = get_user_public_key(sender)
 
         signable_payload = crypto.make_signable_payload(
-            msg_id, r_id, sender, timestamp, nonce, ciphertext
+            msg_id,
+            r_id,
+            sender,
+            timestamp,
+            nonce,
+            ciphertext,
         )
 
         signature_valid = False
+
         if pub_key:
             signature_valid = crypto.verify_signature(
-                pub_key, signature, signable_payload
+                pub_key,
+                signature,
+                signable_payload,
             )
 
         decrypted_text = None
         decryption_valid = False
+
         try:
-            decrypted_text = crypto.decrypt_message(ciphertext, nonce)
+            decrypted_text = crypto.decrypt_message(
+                ciphertext,
+                nonce,
+            )
             decryption_valid = True
+
         except InvalidTag:
             decrypted_text = "[TAMPERED: AES-GCM Integrity Check Failed]"
+
         except Exception as e:
             decrypted_text = f"[DECRYPTION ERROR: {e}]"
 
