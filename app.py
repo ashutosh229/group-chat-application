@@ -220,7 +220,6 @@ if __name__ == "__main__":
         "app:app",
         host="0.0.0.0",
         port=config.PORT,
-        workers=4,
         ws_ping_interval=config.HEARTBEAT_INTERVAL_MS / 1000,
         ws_ping_timeout=config.HEARTBEAT_INTERVAL_MS / 1000,
         log_level="warning",
