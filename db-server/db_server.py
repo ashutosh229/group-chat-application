@@ -9,10 +9,19 @@ Endpoints:
   GET    /messages?room=&limit=  — retrieve messages (oldest-first)
   PUT    /user_keys/{username}   — upsert a user's Ed25519 public key
   GET    /user_keys/{username}   — fetch a user's public key
+  GET    /health                 — cheap liveness probe
 
 Environment variables:
   SQLITE_DB_PATH   — path to the SQLite file  (default: chat.db)
   DB_SERVER_PORT   — port to listen on        (default: 5500)
+
+Concurrency note:
+  The database runs in WAL mode, which is specifically designed to allow
+  any number of concurrent readers while a single writer is active. The
+  process-wide lock below is therefore only taken around writes
+  (INSERT/UPDATE); reads are left unlocked so that a burst of GET
+  requests doesn't serialize behind each other (or behind a write) for
+  no reason.
 """
 
 import os
@@ -28,13 +37,13 @@ from pydantic import BaseModel
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DB_PATH = os.environ.get('SQLITE_DB_PATH', 'chat.db')
-PORT    = int(os.environ.get('DB_SERVER_PORT', '5500'))
+DB_PATH = os.environ.get("SQLITE_DB_PATH", "chat.db")
+PORT = int(os.environ.get("DB_SERVER_PORT", "5500"))
 
 # ---------------------------------------------------------------------------
 # Database — single shared connection with WAL mode for concurrent reads
 # ---------------------------------------------------------------------------
-_lock = threading.Lock()
+_write_lock = threading.Lock()  # guards INSERT/UPDATE only — NOT reads
 _conn: sqlite3.Connection = None
 
 
@@ -44,17 +53,17 @@ def _get_conn() -> sqlite3.Connection:
         _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         _conn.row_factory = sqlite3.Row
         # WAL mode: allows concurrent readers while a writer is active
-        _conn.execute('PRAGMA journal_mode=WAL')
-        _conn.execute('PRAGMA synchronous=NORMAL')
-        _conn.execute('PRAGMA cache_size=-32000')   # 32 MB page cache
+        _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.execute("PRAGMA synchronous=NORMAL")
+        _conn.execute("PRAGMA cache_size=-32000")  # 32 MB page cache
         _conn.commit()
     return _conn
 
 
 def _init_schema() -> None:
-    with _lock:
+    with _write_lock:
         conn = _get_conn()
-        conn.executescript('''
+        conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 id          TEXT PRIMARY KEY,
                 room_id     TEXT    NOT NULL DEFAULT "general",
@@ -73,28 +82,28 @@ def _init_schema() -> None:
                 username    TEXT PRIMARY KEY,
                 public_key  TEXT NOT NULL
             );
-        ''')
+        """)
         conn.commit()
-    print(f'[db_server] SQLite database ready: {os.path.abspath(DB_PATH)}')
+    print(f"[db_server] SQLite database ready: {os.path.abspath(DB_PATH)}")
 
 
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
-app = FastAPI(title='SQLite DB Server', version='1.0')
+app = FastAPI(title="SQLite DB Server", version="1.0")
 
 
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
 class MessageIn(BaseModel):
-    id:         str
-    room_id:    str  = 'general'
-    sender:     str  = 'anonymous'
-    ciphertext: str  = ''
-    nonce:      str  = ''
-    signature:  str  = ''
-    timestamp:  int  = 0
+    id: str
+    room_id: str = "general"
+    sender: str = "anonymous"
+    ciphertext: str = ""
+    nonce: str = ""
+    signature: str = ""
+    timestamp: int = 0
 
 
 class UserKeyIn(BaseModel):
@@ -104,52 +113,61 @@ class UserKeyIn(BaseModel):
 # ---------------------------------------------------------------------------
 # Routes — Messages
 # ---------------------------------------------------------------------------
-@app.post('/messages', status_code=201)
+@app.post("/messages", status_code=201)
 def upsert_message(msg: MessageIn):
     """Insert or replace a message (deduplication on primary key `id`)."""
-    with _lock:
+    with _write_lock:
         conn = _get_conn()
         conn.execute(
-            '''
+            """
             INSERT OR REPLACE INTO messages
                 (id, room_id, sender, ciphertext, nonce, signature, timestamp)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''',
-            (msg.id, msg.room_id, msg.sender,
-             msg.ciphertext, msg.nonce, msg.signature, msg.timestamp),
+            """,
+            (
+                msg.id,
+                msg.room_id,
+                msg.sender,
+                msg.ciphertext,
+                msg.nonce,
+                msg.signature,
+                msg.timestamp,
+            ),
         )
         conn.commit()
-    return {'ok': True, 'id': msg.id}
+    return {"ok": True, "id": msg.id}
 
 
-@app.get('/messages')
+@app.get("/messages")
 def get_messages(room: Optional[str] = None, limit: int = 50):
     """
     Return up to `limit` messages, oldest-first.
     Optionally filter by `room`.
+
+    Unlocked: WAL mode lets this run concurrently with other reads and
+    with an in-flight write, so it never queues behind message posts.
     """
-    with _lock:
-        conn = _get_conn()
-        if room:
-            cursor = conn.execute(
-                '''
-                SELECT * FROM messages
-                WHERE room_id = ?
-                ORDER BY timestamp DESC
-                LIMIT ?
-                ''',
-                (room, limit),
-            )
-        else:
-            cursor = conn.execute(
-                '''
-                SELECT * FROM messages
-                ORDER BY timestamp DESC
-                LIMIT ?
-                ''',
-                (limit,),
-            )
-        rows = [dict(r) for r in cursor.fetchall()]
+    conn = _get_conn()
+    if room:
+        cursor = conn.execute(
+            """
+            SELECT * FROM messages
+            WHERE room_id = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (room, limit),
+        )
+    else:
+        cursor = conn.execute(
+            """
+            SELECT * FROM messages
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+    rows = [dict(r) for r in cursor.fetchall()]
 
     # Reverse so that response is oldest → newest
     return list(reversed(rows))
@@ -158,48 +176,47 @@ def get_messages(room: Optional[str] = None, limit: int = 50):
 # ---------------------------------------------------------------------------
 # Routes — User Keys
 # ---------------------------------------------------------------------------
-@app.put('/user_keys/{username}', status_code=200)
+@app.put("/user_keys/{username}", status_code=200)
 def upsert_user_key(username: str, body: UserKeyIn):
     """Insert or replace the Ed25519 public key for a user."""
     uname = username.lower()
-    with _lock:
+    with _write_lock:
         conn = _get_conn()
         conn.execute(
-            'INSERT OR REPLACE INTO user_keys (username, public_key) VALUES (?, ?)',
+            "INSERT OR REPLACE INTO user_keys (username, public_key) VALUES (?, ?)",
             (uname, body.public_key),
         )
         conn.commit()
-    return {'ok': True, 'username': uname}
+    return {"ok": True, "username": uname}
 
 
-@app.get('/user_keys/{username}')
+@app.get("/user_keys/{username}")
 def get_user_key(username: str):
-    """Fetch the Ed25519 public key for a user."""
+    """Fetch the Ed25519 public key for a user. Unlocked read (see note above)."""
     uname = username.lower()
-    with _lock:
-        conn = _get_conn()
-        row = conn.execute(
-            'SELECT public_key FROM user_keys WHERE username = ?',
-            (uname,),
-        ).fetchone()
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT public_key FROM user_keys WHERE username = ?",
+        (uname,),
+    ).fetchone()
 
     if row is None:
-        raise HTTPException(status_code=404, detail='Key not found')
-    return {'username': uname, 'public_key': row['public_key']}
+        raise HTTPException(status_code=404, detail="Key not found")
+    return {"username": uname, "public_key": row["public_key"]}
 
 
 # ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
-@app.get('/health')
+@app.get("/health")
 def health():
-    return {'status': 'ok', 'db': os.path.abspath(DB_PATH)}
+    return {"status": "ok", "db": os.path.abspath(DB_PATH)}
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-if __name__ == '__main__':
+if __name__ == "__main__":
     _init_schema()
-    print(f'[db_server] Listening on 0.0.0.0:{PORT}')
-    uvicorn.run('db_server:app', host='0.0.0.0', port=PORT, log_level='warning')
+    print(f"[db_server] Listening on 0.0.0.0:{PORT}")
+    uvicorn.run("db_server:app", host="0.0.0.0", port=PORT, log_level="warning")
