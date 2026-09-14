@@ -2,10 +2,11 @@ import json
 import time
 import requests
 
+
 def test():
-    base_url = "http://127.0.0.1:5001"
+    base_url = "http://10.1.75.79:6205"
     print(f"1. Testing POST /message on {base_url}...")
-    
+
     # 1. Send first message
     msg_id = f"test_id_{int(time.time()*1000)}"
     payload = {
@@ -32,7 +33,7 @@ def test():
     form_payload = {
         "client-name": "Bob",
         "msg": "Form data message test",
-        "id": f"bob_{int(time.time()*1000)}"
+        "id": f"bob_{int(time.time()*1000)}",
     }
     r_form = requests.post(f"{base_url}/message", data=form_payload, timeout=5)
     print(f"Form POST status: {r_form.status_code}")
@@ -53,6 +54,7 @@ def test():
     assert "verified" in feed_data[0]
 
     print("\n>>> ALL API TESTS PASSED SUCCESSFULLY! <<<")
+
 
 if __name__ == "__main__":
     test()
